@@ -20,6 +20,7 @@ import json
 import re
 import html
 import requests
+import time
 from datetime import datetime, timedelta
 
 STATE_FILE = "state.json"
@@ -150,10 +151,26 @@ def summarize_with_gemini(newsletters):
         f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    resp = requests.post(url, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    max_attempts = 4
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        resp = requests.post(url, json=payload, timeout=60)
+        if resp.status_code in (429, 500, 502, 503, 504):
+            last_error = resp
+            wait_seconds = 2 ** attempt  # 2s, 4s, 8s, 16s
+            print(
+                f"Gemini respondio {resp.status_code} (intento {attempt}/{max_attempts}). "
+                f"Reintentando en {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    # Se agotaron los reintentos: dejamos que falle con el ultimo error real
+    last_error.raise_for_status()
 
 
 # ---------- Paso 3: entregar el resultado (herramienta: SMTP) ----------
