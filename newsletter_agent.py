@@ -5,7 +5,8 @@ Cada vez que corre:
   1. Se conecta a Gmail por IMAP y revisa los correos de los ultimos 2 dias.
   2. Filtra cuales parecen newsletters (heuristica: List-Unsubscribe, Precedence, remitente).
   3. Descarta los que ya proceso antes (memoria/estado en state.json).
-  4. Le pide a Gemini que sintetice todo en un solo resumen.
+  4. Le pide a Gemini que sintetice todo en un solo resumen (con reintentos).
+     Si Gemini sigue fallando, usa Groq como modelo de respaldo (fallback).
   5. Envia el resumen como un correo nuevo.
   6. Actualiza el estado para no repetir los mismos newsletters manana.
 """
@@ -28,6 +29,7 @@ STATE_FILE = "state.json"
 GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # opcional: fallback si Gemini falla
 DIGEST_TO = os.environ.get("DIGEST_TO_EMAIL", GMAIL_ADDRESS)
 
 
@@ -130,15 +132,14 @@ def fetch_newsletters(state):
     return newsletters
 
 
-# ---------- Paso 2: sintetizar (herramienta: modelo Gemini) ----------
+# ---------- Paso 2: sintetizar (herramienta: modelo Gemini, con respaldo en Groq) ----------
 
-def summarize_with_gemini(newsletters):
+def build_prompt(newsletters):
     combined = "\n\n---\n\n".join(
         f"De: {n['from']}\nAsunto: {n['subject']}\nContenido:\n{n['body']}"
         for n in newsletters
     )
-
-    prompt = (
+    return (
         "Eres un asistente que resume newsletters de correo para una persona ocupada. "
         "A continuacion tienes varios correos de newsletter. Escribe un resumen "
         "consolidado en espanol, organizado por newsletter, en texto plano con "
@@ -146,19 +147,20 @@ def summarize_with_gemini(newsletters):
         "Se breve, concreto y ameno.\n\n" + combined
     )
 
+
+def summarize_with_gemini(prompt, max_attempts=3):
+    """Intenta sintetizar con Gemini. Reintenta ante errores temporales (429/5xx).
+    Devuelve el texto del resumen, o None si se agotan los intentos."""
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
-    max_attempts = 4
-    last_error = None
     for attempt in range(1, max_attempts + 1):
         resp = requests.post(url, json=payload, timeout=60)
         if resp.status_code in (429, 500, 502, 503, 504):
-            last_error = resp
-            wait_seconds = 2 ** attempt  # 2s, 4s, 8s, 16s
+            wait_seconds = 2 ** attempt  # 2s, 4s, 8s
             print(
                 f"Gemini respondio {resp.status_code} (intento {attempt}/{max_attempts}). "
                 f"Reintentando en {wait_seconds}s..."
@@ -169,8 +171,38 @@ def summarize_with_gemini(newsletters):
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
-    # Se agotaron los reintentos: dejamos que falle con el ultimo error real
-    last_error.raise_for_status()
+    print("Gemini no respondio tras varios intentos. Se intentara con Groq (fallback).")
+    return None
+
+
+def summarize_with_groq(prompt):
+    """Respaldo: sintetiza usando Groq (API compatible con OpenAI)."""
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "Gemini fallo y no hay GROQ_API_KEY configurado para el fallback."
+        )
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def summarize(newsletters):
+    """Orquesta la sintesis: primero Gemini, si falla usa Groq."""
+    prompt = build_prompt(newsletters)
+
+    summary = summarize_with_gemini(prompt)
+    if summary is not None:
+        return summary
+
+    return summarize_with_groq(prompt)
 
 
 # ---------- Paso 3: entregar el resultado (herramienta: SMTP) ----------
@@ -198,7 +230,7 @@ def main():
         print("No hay newsletters nuevos. No se envia nada.")
         return
 
-    summary = summarize_with_gemini(newsletters)
+    summary = summarize(newsletters)
     send_digest_email(summary, len(newsletters))
 
     state["processed_ids"].extend(n["id"] for n in newsletters)
