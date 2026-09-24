@@ -147,7 +147,7 @@ def summarize_with_gemini(newsletters):
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     resp = requests.post(url, json=payload, timeout=60)
